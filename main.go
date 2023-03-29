@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net/http"
@@ -11,13 +13,17 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"golang.org/x/sync/semaphore"
 )
 
 var (
-	token     = os.Getenv("RANCHER_TOKEN")
-	serverURL = os.Getenv("SERVER_URL")
+	bearer    = "Bearer " + os.Getenv("RANCHER_TOKEN")
+	serverURL = os.Getenv("RANCHER_SERVER")
+	sem       = semaphore.NewWeighted(100)
 )
 
 func main() {
@@ -28,7 +34,13 @@ func main() {
 
 	hostName := []byte(parsed.Hostname())
 	seen := map[string]bool{serverURL: true}
-	client := &http.Client{}
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	client := &http.Client{
+		Transport: tr,
+		Timeout:   time.Second * 60,
+	}
 	var wg sync.WaitGroup
 	newURLs := make(chan *url.URL)
 	done := make(chan struct{})
@@ -56,7 +68,6 @@ func main() {
 				}
 				seen[link] = true
 				wg.Add(1)
-				fmt.Println("visiting:", link)
 				go GetUrls(client, link, hostName, &wg, newURLs)
 			}
 		}
@@ -71,19 +82,33 @@ func main() {
 	fmt.Println(strings.Join(actionList, "\n"))
 }
 
-func GetUrls(client *http.Client, nextUrl string, hostname []byte, wg *sync.WaitGroup, newURLs chan *url.URL) error {
+func GetUrls(client *http.Client, nextUrl string, hostname []byte, wg *sync.WaitGroup, newURLs chan *url.URL) {
 	defer wg.Done()
+	if strings.HasSuffix(nextUrl, "readme") {
+		return
+	}
+	if err := sem.Acquire(context.TODO(), 1); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to acquire semaphore: %s\n", err)
+		return
+	}
+	fmt.Println("visiting:", nextUrl)
+	defer sem.Release(1)
 	req, err := http.NewRequest(http.MethodGet, nextUrl, nil)
 	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
+		fmt.Fprintf(os.Stderr, "Failed to create request: %s\n", err)
+		return
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Authorization", bearer)
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed request: %w", err)
+		fmt.Fprintf(os.Stderr, "Failed request: %s\n", err)
+		return
 	}
+	defer resp.Body.Close()
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Split(ScanURL(hostname))
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024*1024)
 	for scanner.Scan() {
 		link := scanner.Text()
 		if !strings.HasPrefix(link, "https://") {
@@ -99,7 +124,6 @@ func GetUrls(client *http.Client, nextUrl string, hostname []byte, wg *sync.Wait
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed reading input: %s\n", err)
 	}
-	return nil
 }
 func add(s string, m map[string]bool) map[string]bool {
 	if m == nil {
